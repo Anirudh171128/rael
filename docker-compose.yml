@@ -1,0 +1,26 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: rael
+      POSTGRES_PASSWORD: rael
+      POSTGRES_DB: rael
+    ports:
+      - "5432:5432"
+    volumes:
+      - rael_pgdata:/var/lib/postgresql/data
+      # `z` relabels the file for SELinux hosts (podman/RHEL/Fedora); harmless on Docker.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro,z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rael"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  rael_pgdata:

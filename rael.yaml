@@ -1,0 +1,630 @@
+# =============================================================================
+# RAEL — Multi-Agent Orchestration Specification (YAML-Driven Runtime)
+# =============================================================================
+# This file IS the runtime configuration. The graph engine reads it at boot,
+# registers every agent as a LangGraph node, wires edges + conditional routing,
+# and dispatches tool calls in real time.
+#
+# Nothing is hardcoded in Python — add/remove/reorder agents here and the
+# graph rebuilds on next boot.
+# =============================================================================
+
+system:
+  name: rael
+  version: "1.0"
+  orchestration_framework: langgraph
+  description: >
+    Autonomous AI sales rep. One Orchestrator node routes a lead's state
+    through specialist sub-agents. Nodes communicate only by reading/writing
+    the shared state object and by emitting typed messages on the event bus —
+    no agent calls another agent directly.
+
+# -----------------------------------------------------------------------------
+# 1. SHARED STATE — the single TypedDict that flows through the graph.
+#    Every agent reads what it needs and writes back only its own fields.
+# -----------------------------------------------------------------------------
+shared_state:
+  lead_id:
+    type: int
+    required: false
+  stage:
+    type: enum
+    values: [scouted, verified, scored_pre_enrich, enriched, scored_post_enrich,
+             awaiting_approval, outreach_sent, replied, meeting_booked, closed, parked]
+    default: scouted
+  company:
+    name: { type: string }
+    domain: { type: string }
+    verified: { type: bool, default: false }
+    firmographics:
+      industry: { type: string }
+      employee_count: { type: int }
+      funding_stage: { type: string }
+  contact:
+    name: { type: string }
+    title: { type: string }
+    email: { type: string }
+    phone: { type: string }
+    linkedin_url: { type: string }
+  scores:
+    pre_enrich_score: { type: int, default: 0 }
+    post_enrich_score: { type: int, default: 0 }
+    reasoning: { type: string }
+  brain_config:
+    icp_industries: { type: list, items: string }
+    buyer_titles: { type: list, items: string }
+    positive_signals: { type: list, items: string }
+    negative_signals: { type: list, items: string }
+    competitive_signals: { type: list, items: string }
+    search_themes: { type: list, items: string }
+  outreach:
+    channel: { type: enum, values: [email, linkedin, whatsapp] }
+    draft_message: { type: string }
+    approved: { type: bool, default: false }
+    sent_at: { type: timestamp }
+    open_count: { type: int, default: 0 }
+  reply:
+    classification: { type: enum, values: [warm, faq, objection, unsubscribe, ooo, none] }
+    text: { type: string }
+  human_checkpoint:
+    needed: { type: bool, default: false }
+    reason: { type: string }
+  outcome:
+    label: { type: enum, values: [great_fit, wrong_fit, follow_up, closed, none] }
+    deal_value: { type: float, default: 0.0 }
+  trail: { type: list, items: string }
+  audit_log: { type: list, items: { agent: string, action: string, timestamp: timestamp } }
+
+# -----------------------------------------------------------------------------
+# 2. MESSAGE PROTOCOL — envelope used for every inter-agent event on the bus.
+# -----------------------------------------------------------------------------
+message_protocol:
+  envelope_schema:
+    message_id: uuid
+    correlation_id: uuid
+    sender: string
+    recipient: string
+    type:
+      enum: [event, command, escalation, data_update]
+    payload: object
+    timestamp: timestamp
+  transport: in_process_event_bus
+
+# -----------------------------------------------------------------------------
+# 3. TOOLS REGISTRY — every callable tool an agent can use.
+#    The runtime resolves `module:function` at boot, validates signatures,
+#    and injects them into the agent's tool belt.
+# -----------------------------------------------------------------------------
+tools:
+  llm_complete:
+    module: backend.app.services.llm
+    function: complete
+    description: "Generate text via the configured LLM (Gemini → Claude → mock)"
+
+  llm_classify:
+    module: backend.app.services.llm
+    function: classify
+    description: "Classify text into one of the provided labels"
+
+  llm_parse_json:
+    module: backend.app.services.llm
+    function: parse_json
+    description: "Parse JSON from raw LLM output"
+
+  web_search:
+    module: backend.app.services.discovery
+    function: execute_search_plan
+    description: "Execute a search plan via Tavily / headless browser / mock"
+
+  generate_search_plan:
+    module: backend.app.services.discovery
+    function: generate_search_plan
+    description: "Generate search queries from the Brain understanding"
+
+  verify_company:
+    module: backend.app.services.discovery
+    function: verify_company
+    description: "Verify a company exists and pull firmographics"
+
+  enrich:
+    module: backend.app.services.enrichment
+    function: enrich
+    description: "Find the decision-maker via Apollo (people search + email reveal) — never mocked"
+
+  scan_signals:
+    module: backend.app.services.signals
+    function: scan_signals
+    description: "Scan funding/hiring/news feeds for buying signals"
+
+  send_email:
+    module: backend.app.services.comms
+    function: send_email
+    description: "Send an email via SendGrid/Resend"
+
+  send_whatsapp:
+    module: backend.app.services.comms
+    function: send_whatsapp
+    description: "Send a WhatsApp message via the Business API"
+
+  embed:
+    module: backend.app.services.embeddings
+    function: embed
+    description: "Generate a vector embedding for semantic search"
+
+  log_event:
+    module: backend.app.events
+    function: log_event
+    description: "Persist + broadcast an agent action to the live feed"
+
+# -----------------------------------------------------------------------------
+# 4. AGENTS (graph nodes)
+#    Each agent maps to a Python module. The runtime calls `module.run(state)`
+#    for pipeline agents or `module.run()` for standalone agents.
+# -----------------------------------------------------------------------------
+agents:
+
+  # ── The central router ─────────────────────────────────────────────────
+  orchestrator:
+    module: agents.orchestrator
+    role: "Central router and decision-maker"
+    triggers:
+      - on_any_state_update
+      - on_timer: { interval: 3h }
+      - on_human_action
+    reads: [stage, human_checkpoint, scores, outreach]
+    writes: [stage]
+    decision_logic:
+      - condition: "human_checkpoint.needed == true"
+        route_to: human
+      - condition: "stage == 'scouted'"
+        route_to: enrichment_agent
+      - condition: "stage == 'awaiting_approval' and outreach.approved == true"
+        route_to: outreach_agent
+      - default: hold
+    communicates_with: [all_agents, human]
+
+  # ── Brain — translates 2-sentence setup into hunting strategy ──────────
+  brain_agent:
+    module: agents.brain_agent
+    function: run
+    role: "Translates the user's product description into a structured hunting strategy"
+    triggers:
+      - on_event: train_rael_submit
+    reads: []
+    writes: [brain_config]
+    tools: [llm_complete, llm_parse_json, log_event]
+    config:
+      system_prompt: >
+        You distil a B2B product and a description of who to target into a
+        prospecting 'brain' for the INDIAN market only. You are NOT finding
+        companies. Given what we sell and the kinds of companies we want to
+        target, infer: the industry/segment, who buys, what observable signals
+        mean they need us, who to avoid, and what competitive software they use. Every prospect is a company based in
+        India. Return ONLY JSON: {"industry":"...","buyers":["..."],"pain_signals":["..."],
+        "negative_signals":["..."],"competitive_signals":["..."],"search_themes":["..."]}.
+        pain_signals = observable buying triggers (e.g. 'hiring SDRs').
+        search_themes = short phrases to search the web for these prospects in India.
+      max_tokens: 1500
+      fallback_buyers: ["Founder", "VP Sales", "CRO"]
+      fallback_pain_signals:
+        - "hiring SDRs or AEs"
+        - "recently funded"
+        - "new sales leader joined"
+        - "expanding outbound"
+        - "scaling go-to-market"
+      fallback_negative_signals: ["under 20 employees", "no sales team"]
+      fallback_search_themes: ["scaling sales in India", "outbound efficiency", "recently funded India"]
+    emits_message:
+      type: data_update
+      recipient: discovery_agent
+      payload: [brain_config]
+
+  # ── Discovery — scouts the live web for real candidate companies ───────
+  discovery_agent:
+    module: agents.discovery_agent
+    function: run
+    role: "Scout — searches the live web for real candidate companies"
+    triggers:
+      - on_timer: { interval: 3h }
+      - on_manual: scout_now
+    reads: [brain_config]
+    writes: [company.name, company.domain, stage]
+    tools: [generate_search_plan, web_search, verify_company, log_event]
+    constraints:
+      never_fabricate_companies: true
+      max_queries_per_run: 6
+      filters: [exclude_job_boards, exclude_news_aggregators]
+    config:
+      max_candidates: 24
+      trigger_strength:
+        intent: 90
+        funding: 85
+        hiring: 75
+        leadership: 70
+        growth: 60
+        news: 55
+      default_trigger: 50
+      unverified_penalty: 15
+    emits_message:
+      type: event
+      recipient: qualification_agent
+      payload: [company]
+
+  # ── Signal — passive radar on funding/hiring/news feeds ────────────────
+  signal_agent:
+    module: agents.signal_agent
+    function: run
+    role: "Passive radar on funding/hiring/news feeds"
+    triggers:
+      - on_webhook: [funding_feed, hiring_feed, news_feed]
+    status: dormant_until_api_keys_provided
+    reads: []
+    writes: [company.name, brain_config.positive_signals]
+    tools: [scan_signals, log_event]
+    config:
+      signal_threshold: 50
+      boost_types: [intent, funding]
+      boost_amount: 10
+    emits_message:
+      type: event
+      recipient: discovery_agent
+      payload: [company]
+
+  # ── Enrichment — Apollo-only, human-approved (credits are precious) ────
+  enrichment_agent:
+    module: agents.enrichment_agent
+    function: run
+    role: "Researcher — finds the decision-maker via Apollo, only after the rep approves"
+    triggers:
+      - on_human_action: enrich_approved   # POST /api/leads/{id}/enrich — the ONLY trigger
+    reads: [company, lead_id, brain_config.buyer_titles]
+    writes: [contact, stage]
+    tools: [enrich, log_event]
+    constraints:
+      never_fabricate_contacts: true   # no Apollo result → lead waits as 'incomplete'
+      auto_run: false                  # discovery raises enrich_request; never enriches itself
+    human_gate:
+      required: true
+      reason: "Apollo credits are spent per reveal — the rep approves every enrichment"
+    emits_message:
+      type: data_update
+      recipient: qualification_agent
+      payload: [contact, company]
+
+  # ── Qualification — scores leads 0-100 against ICP ─────────────────────
+  qualification_agent:
+    module: agents.qualification_agent
+    function: run
+    role: "Judge — scores leads 0-100 against ICP, twice (pre and post enrichment)"
+    triggers:
+      - on_message:
+          type: data_update
+          from: [discovery_agent, enrichment_agent]
+    reads: [company, contact, brain_config, lead_id]
+    writes: [scores.pre_enrich_score, scores.post_enrich_score, scores.reasoning, stage]
+    tools: [log_event]
+    gates:
+      - name: promotion_gate
+        condition: "scores.pre_enrich_score >= 60 and company.verified == true"
+        pass_action:
+          set: { stage: verified }
+        fail_action:
+          set: { stage: parked }
+      - name: outreach_gate
+        condition: "scores.post_enrich_score >= 65"
+        pass_action:
+          set: { stage: scored_post_enrich }
+        fail_action:
+          set: { stage: parked }
+    emits_message:
+      type: event
+      recipient: orchestrator
+      payload: [scores, stage]
+
+  # ── Outreach — drafts and sends the first-touch message ────────────────
+  outreach_agent:
+    module: agents.outreach_agent
+    function: run
+    role: "Copywriter — drafts and (on approval) sends the first-touch message"
+    triggers:
+      - on_message:
+          type: event
+          from: orchestrator
+          when: "stage == 'scored_post_enrich'"
+    reads: [contact, company, scores, lead_id]
+    writes: [outreach.draft_message, outreach.channel, outreach.approved, outreach.sent_at, stage]
+    tools: [llm_complete, send_email, send_whatsapp, log_event]
+    human_gate:
+      required: true
+      default_mode: manual_approval
+      presents_to_human: [outreach.draft_message, outreach.channel]
+      waits_for: outreach.approved
+    on_send:
+      channel_order: [email, linkedin, whatsapp]
+      sets: [outreach.sent_at]
+    config:
+      channel_sequence: [email, linkedin, whatsapp]
+      system_prompt: >
+        You are Rael, an SDR writing a first-touch outreach message.
+        Write 2-3 sentences, reference the trigger, sound like a thoughtful
+        human, no fluff.
+    emits_message:
+      type: event
+      recipient: orchestrator
+      payload: [outreach]
+
+  # ── Reply Handler — classifies and routes inbound replies ──────────────
+  reply_handler_agent:
+    module: agents.reply_handler_agent
+    function: run
+    role: "Front desk — classifies and responds to inbound replies"
+    triggers:
+      - on_webhook: inbound_reply
+    reads: [reply.text, lead_id]
+    writes: [reply.classification, stage]
+    tools: [llm_classify, llm_complete, send_email, send_whatsapp, log_event]
+    config:
+      classification_labels: [Warm, FAQ, Objection, "Out of office", Unsubscribe, Unknown]
+      escalate_labels: [Warm, Unknown]
+      objection_map:
+        "already use": "Totally — most teams we work with keep their existing stack. We're the layer that makes those lists actually convert, not a replacement."
+        "too expensive": "Fair. Most teams find the time saved pays for it in week one — happy to show the math on your numbers."
+        "no budget": "Understood. Worth a 15-min look now so it's on your radar when budget frees up?"
+    routing:
+      - condition: "reply.classification == 'warm'"
+        action: escalate_to_human
+        emits_message:
+          type: escalation
+          recipient: human
+          priority: urgent
+      - condition: "reply.classification in ['faq', 'objection']"
+        action: auto_respond
+      - condition: "reply.classification == 'unsubscribe'"
+        action: honor_and_close
+      - condition: "reply.classification == 'ooo'"
+        action: retry_later
+
+  # ── Briefing — prepares pre-call brief before meetings ─────────────────
+  briefing_agent:
+    module: agents.briefing_agent
+    function: run
+    role: "Chief of staff — prepares pre-call brief ~30 min before a meeting"
+    triggers:
+      - on_timer:
+          relative_to: meeting_start
+          offset: -30m
+    reads: [company, contact, reply, scores, lead_id]
+    writes: []
+    tools: [llm_complete, send_whatsapp, log_event]
+    config:
+      system_prompt: >
+        You are Rael preparing a sales rep for a call. Produce a tight brief
+        with: why they're talking to you, what to lead with, and the likely
+        objection + response. Keep it scannable.
+      max_tokens: 400
+    emits_message:
+      type: data_update
+      recipient: human
+      payload: [brief_document]
+
+  # ── Reporting — scheduled digests ──────────────────────────────────────
+  reporting_agent:
+    module: agents.reporting_agent
+    functions:
+      morning: morning
+      end_of_day: end_of_day
+    role: "Sends scheduled digests"
+    triggers:
+      - on_timer: { cron: "0 8 * * *" }
+      - on_timer: { cron: "0 18 * * *" }
+    reads: [audit_log, outcome, outreach]
+    writes: []
+    tools: [send_whatsapp, log_event]
+    emits_message:
+      type: event
+      recipient: human
+      payload: [digest_message]
+
+  # ── Memory — learns from outcomes and re-tunes scoring weights ─────────
+  memory_agent:
+    module: agents.memory_agent
+    functions:
+      run: run
+      apply_outcomes: apply_outcomes
+    role: "Learns from outcomes and re-tunes scoring weights"
+    triggers:
+      - on_message:
+          type: event
+          payload_contains: outcome
+      - on_timer: { cron: "0 2 * * *" }
+    reads: [outcome, scores, brain_config]
+    writes: [brain_config.positive_signals, brain_config.negative_signals]
+    tools: [embed, log_event]
+    config:
+      weight_delta:
+        closed: 0.15
+        great_fit: 0.10
+        wrong_fit: -0.12
+        follow_up: 0.0
+      tuned_dimensions: [trigger, industry, size]
+      base_weight: 1.0
+      weight_min: 0.2
+      weight_max: 3.0
+      reengage_after_days: 90
+      reengage_exclude_statuses: [closed, unsubscribed]
+    emits_message:
+      type: data_update
+      recipient: qualification_agent
+      payload: [brain_config]
+
+# -----------------------------------------------------------------------------
+# 5. GRAPH EDGES — LangGraph node connections.
+#    The runtime builds StateGraph edges from this section.
+# -----------------------------------------------------------------------------
+edges:
+  # Static edges: A always flows to B.
+  static:
+    - from: brain_agent
+      to: discovery_agent
+    - from: discovery_agent
+      to: enrichment_agent
+    - from: enrichment_agent
+      to: qualification_agent
+    - from: reply_handler_agent
+      to: briefing_agent
+    - from: memory_agent
+      to: qualification_agent
+
+  # Conditional edges: route based on state fields.
+  conditional:
+    - from: qualification_agent
+      condition_field: stage
+      routes:
+        verified: enrichment_agent
+        scored_post_enrich: outreach_agent
+        parked: __end__
+        watching: __end__
+
+    - from: outreach_agent
+      condition_field: outreach.approved
+      routes:
+        true: orchestrator
+        false: __end__     # waits at approval card
+
+    - from: reply_handler_agent
+      condition_field: reply.classification
+      routes:
+        warm: __end__              # escalated to human
+        faq: reply_handler_agent   # self-loop, auto-answer
+        objection: reply_handler_agent
+        unsubscribe: __end__
+        ooo: __end__               # retry scheduled
+
+# -----------------------------------------------------------------------------
+# 6. PIPELINES — named sequences the orchestrator dispatches.
+#    Each pipeline is a chain of agent nodes. The runtime walks them in order,
+#    evaluating the conditional edges between steps.
+# -----------------------------------------------------------------------------
+pipelines:
+
+  lead_pipeline:
+    description: "Full lead lifecycle: enrich → qualify → gate → outreach"
+    entry_event: lead_pipeline
+    requires: [lead_id]
+    steps:
+      - node: enrichment_agent
+        next_on:
+          qualify: qualification_agent
+          needs_review: __end__
+          default: __end__
+
+      - node: qualification_agent
+        next_on:
+          outreach: gate
+          hold: __end__
+          default: __end__
+
+      - node: gate
+        type: decision_gate
+        reads: [scores.post_enrich_score]
+        condition: "approval_mode == true"
+        true_action: hold_for_approval
+        false_action: execute
+        next: outreach_agent
+
+      - node: outreach_agent
+        next_on:
+          await_approval: __end__
+          await_reply: __end__
+          default: __end__
+
+  discovery_cycle:
+    description: "Scout the market, then ASK the rep before enriching (Apollo credits)"
+    entry_event: discovery_cycle
+    steps:
+      - node: discovery_agent
+        post_action: request_enrichment
+        # New leads do NOT enter lead_pipeline automatically — the dashboard pops
+        # an approval prompt; POST /api/leads/{id}/enrich starts the pipeline.
+
+  signal_cycle:
+    description: "Scan signal feeds, then ask the rep before enriching"
+    entry_event: signal_cycle
+    steps:
+      - node: signal_agent
+        post_action: request_enrichment
+
+  build_brain:
+    description: "Distil the Fit Model into a Brain"
+    entry_event: build_brain
+    steps:
+      - node: brain_agent
+
+# -----------------------------------------------------------------------------
+# 7. SCHEDULED JOBS — cron/interval triggers wired to pipelines.
+#    The runtime creates APScheduler jobs from these entries.
+# -----------------------------------------------------------------------------
+scheduled_jobs:
+  - id: discovery_cycle
+    pipeline: discovery_cycle
+    trigger: interval
+    hours: 3
+    enabled_if: "settings.discovery_enabled"
+
+  - id: memory_sweep
+    event: memory_sweep
+    trigger: cron
+    hour: 2
+
+  - id: morning_brief
+    event: morning_brief
+    trigger: cron
+    hour: 8
+
+  - id: end_of_day
+    event: end_of_day
+    trigger: cron
+    hour: 18
+
+# -----------------------------------------------------------------------------
+# 8. HUMAN-IN-THE-LOOP CHECKPOINTS
+# -----------------------------------------------------------------------------
+human_checkpoints:
+  - name: enrichment_approval
+    default: required            # STRICT — Rael never spends Apollo credits alone
+    ui: dashboard_popup          # pops whenever discovery finds new companies
+    actions: [enrich, enrich_all, not_now]
+    blocks_agent: enrichment_agent
+    resumes_on: "POST /api/leads/{id}/enrich"
+
+  - name: outreach_approval
+    default: required
+    ui: whatsapp_style_card
+    actions: [send_it, skip]
+    blocks_agent: outreach_agent
+    resumes_on: "outreach.approved == true or decision == 'skip'"
+
+  - name: warm_reply_escalation
+    default: always
+    ui: urgent_push_notification
+    actions: [walk_me_through_it, hear_briefing]
+    blocks_agent: reply_handler_agent
+
+  - name: outcome_logging
+    default: required
+    ui: four_button_selector
+    actions: [great_fit, wrong_fit, follow_up, closed]
+
+# -----------------------------------------------------------------------------
+# 9. OFFLINE / DEMO MODE
+# -----------------------------------------------------------------------------
+offline_fallback:
+  enabled: true
+  rule: "any tool without a configured API key returns a deterministic mock response"
+  exceptions:
+    - "discovery_agent never fabricates a real company — returns empty set instead"
+    - "enrichment never fabricates a contact — without APOLLO_API_KEY (or when Apollo
+       has no verified person) the lead waits as 'incomplete'"
+  purpose: >
+    Allows the scout → verify → qualify → draft → escalate loop to run with zero
+    live API keys; contacts are the exception and are always real or absent.

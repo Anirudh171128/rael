@@ -1,0 +1,71 @@
+"""Email outreach. Provider waterfall: Resend → SendGrid → SMTP → mock.
+
+SMTP reuses the same credentials that already send the login OTPs, so outreach
+emails go out for real without any extra API key. Mock logs and returns a
+synthetic message id so the Outreach Agent's flow completes offline.
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import smtplib
+from email.message import EmailMessage
+
+import httpx
+
+from ...config import settings
+
+
+def _smtp_send(to: str, subject: str, body: str, from_name: str) -> None:
+    msg = EmailMessage()
+    msg.set_content(body)
+    msg["Subject"] = subject
+    msg["From"] = f"{from_name} <{settings.smtp_username or settings.smtp_from}>"
+    msg["To"] = to
+    server = smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20)
+    server.starttls()
+    server.login(settings.smtp_username, settings.smtp_password)
+    server.send_message(msg)
+    server.quit()
+
+
+async def send_email(to: str, subject: str, body: str, *, from_name: str = "Rael") -> dict:
+    if settings.resend_api_key:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {settings.resend_api_key}"},
+                json={
+                    "from": f"{from_name} <{settings.smtp_from}>",
+                    "to": [to],
+                    "subject": subject,
+                    "text": body,
+                },
+            )
+        if r.status_code < 300:
+            return {"sent": True, "provider": "resend", "message_id": r.json().get("id"), "to": to}
+
+    if settings.sendgrid_api_key:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                "https://api.sendgrid.com/v3/mail/send",
+                headers={"Authorization": f"Bearer {settings.sendgrid_api_key}"},
+                json={
+                    "personalizations": [{"to": [{"email": to}]}],
+                    "from": {"email": settings.smtp_from, "name": from_name},
+                    "subject": subject,
+                    "content": [{"type": "text/plain", "value": body}],
+                },
+            )
+        if r.status_code < 300:
+            return {"sent": True, "provider": "sendgrid", "to": to}
+
+    if settings.smtp_username and settings.smtp_password:
+        try:
+            await asyncio.to_thread(_smtp_send, to, subject, body, from_name)
+            return {"sent": True, "provider": "smtp", "to": to}
+        except Exception as exc:  # fall through to mock so the pipeline never stalls
+            return {"sent": False, "provider": "smtp", "error": str(exc), "to": to}
+
+    msg_id = "mock-" + hashlib.md5(f"{to}{subject}".encode()).hexdigest()[:12]
+    return {"sent": True, "provider": "mock", "message_id": msg_id, "to": to}
