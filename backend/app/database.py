@@ -19,6 +19,13 @@ def _async_url(url: str) -> str:
     They hand out postgres:// or postgresql:// and sometimes ?sslmode=require —
     asyncpg needs the +asyncpg driver marker and `ssl=` instead of `sslmode=`.
     """
+    if not url.strip():
+        raise RuntimeError(
+            "DATABASE_URL is set but empty. On Railway this means the variable "
+            "references a database service that doesn't exist — add a PostgreSQL "
+            "service to the project and point DATABASE_URL at it "
+            "(e.g. ${{Postgres.DATABASE_URL}}), or paste a full postgresql:// URL."
+        )
     if url.startswith("postgres://"):
         url = "postgresql+asyncpg://" + url[len("postgres://"):]
     elif url.startswith("postgresql://"):
