@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -30,7 +31,15 @@ def _async_url(url: str) -> str:
         url = "postgresql+asyncpg://" + url[len("postgres://"):]
     elif url.startswith("postgresql://"):
         url = "postgresql+asyncpg://" + url[len("postgresql://"):]
-    return url.replace("sslmode=", "ssl=")
+    # Rewrite query params for asyncpg: sslmode= → ssl=, and drop libpq-only
+    # params it rejects (Neon appends channel_binding=require).
+    parts = urlsplit(url)
+    params = [
+        ("ssl" if k == "sslmode" else k, v)
+        for k, v in parse_qsl(parts.query)
+        if k != "channel_binding"
+    ]
+    return urlunsplit(parts._replace(query=urlencode(params)))
 
 
 engine = create_async_engine(_async_url(settings.database_url), echo=False, pool_pre_ping=True)
