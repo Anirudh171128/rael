@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     tavily_api_key: str = ""
 
     # Comms
+    brevo_api_key: str = ""
     sendgrid_api_key: str = ""
     resend_api_key: str = ""
     whatsapp_token: str = ""

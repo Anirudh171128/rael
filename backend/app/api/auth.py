@@ -32,6 +32,7 @@ async def send_otp_email(to_email: str, otp: str):
         # so the operator can still log in.
         configured = [
             name for name, key in [
+                ("brevo", settings.brevo_api_key),
                 ("resend", settings.resend_api_key),
                 ("sendgrid", settings.sendgrid_api_key),
                 ("smtp", settings.smtp_username),

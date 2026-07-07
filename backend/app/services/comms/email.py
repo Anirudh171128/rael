@@ -1,4 +1,4 @@
-"""Email outreach. Provider waterfall: Resend → SendGrid → SMTP → mock.
+"""Email outreach. Provider waterfall: Brevo → Resend → SendGrid → SMTP → mock.
 
 SMTP reuses the same credentials that already send the login OTPs, so outreach
 emails go out for real without any extra API key. Mock logs and returns a
@@ -31,6 +31,25 @@ def _smtp_send(to: str, subject: str, body: str, from_name: str) -> None:
 
 async def send_email(to: str, subject: str, body: str, *, from_name: str = "Rael") -> dict:
     errors: list[str] = []
+
+    if settings.brevo_api_key:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(
+                    "https://api.brevo.com/v3/smtp/email",
+                    headers={"api-key": settings.brevo_api_key},
+                    json={
+                        "sender": {"email": settings.smtp_from, "name": from_name},
+                        "to": [{"email": to}],
+                        "subject": subject,
+                        "textContent": body,
+                    },
+                )
+            if r.status_code < 300:
+                return {"sent": True, "provider": "brevo", "message_id": r.json().get("messageId"), "to": to}
+            errors.append(f"brevo {r.status_code}: {r.text[:200]}")
+        except Exception as exc:
+            errors.append(f"brevo: {exc}")
 
     if settings.resend_api_key:
         try:
