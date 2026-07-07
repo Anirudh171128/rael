@@ -4,11 +4,21 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # Railway's UI keeps surrounding quotes and trailing newlines literally,
+    # which silently corrupts pasted API keys (SendGrid then 401s).
+    @field_validator("*", mode="before")
+    @classmethod
+    def _strip_env_noise(cls, v: object) -> object:
+        if isinstance(v, str):
+            return v.strip().strip("'\"").strip()
+        return v
 
     # Core
     database_url: str = "postgresql+asyncpg://rael:rael@localhost:5432/rael"

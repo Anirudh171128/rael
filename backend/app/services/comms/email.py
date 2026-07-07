@@ -66,7 +66,15 @@ async def send_email(to: str, subject: str, body: str, *, from_name: str = "Rael
                 )
             if r.status_code < 300:
                 return {"sent": True, "provider": "sendgrid", "to": to}
-            errors.append(f"sendgrid {r.status_code}: {r.text[:200]}")
+            detail = f"sendgrid {r.status_code}: {r.text[:200]}"
+            if r.status_code == 401:
+                key = settings.sendgrid_api_key
+                detail += (
+                    f" [key fingerprint: len={len(key)},"
+                    f" starts_with_SG={key.startswith('SG.')},"
+                    f" ends={key[-4:] if len(key) >= 4 else '?'}]"
+                )
+            errors.append(detail)
         except Exception as exc:
             errors.append(f"sendgrid: {exc}")
 
