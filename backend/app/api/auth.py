@@ -30,7 +30,14 @@ async def send_otp_email(to_email: str, otp: str):
     if not result.get("sent") or result.get("provider") == "mock":
         # No provider could deliver it — surface the OTP in the server logs
         # so the operator can still log in.
-        print(f"OTP email not delivered ({result.get('error') or result.get('provider')}). OTP for {to_email} is {otp}")
+        configured = [
+            name for name, key in [
+                ("resend", settings.resend_api_key),
+                ("sendgrid", settings.sendgrid_api_key),
+                ("smtp", settings.smtp_username),
+            ] if key
+        ]
+        print(f"OTP email not delivered. configured={configured or 'none'} result={result}. OTP for {to_email} is {otp}")
 
 @router.post("/login")
 async def login(req: LoginRequest, db: AsyncSession = Depends(get_session)):

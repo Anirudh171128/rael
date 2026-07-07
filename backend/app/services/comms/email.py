@@ -30,42 +30,53 @@ def _smtp_send(to: str, subject: str, body: str, from_name: str) -> None:
 
 
 async def send_email(to: str, subject: str, body: str, *, from_name: str = "Rael") -> dict:
+    errors: list[str] = []
+
     if settings.resend_api_key:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(
-                "https://api.resend.com/emails",
-                headers={"Authorization": f"Bearer {settings.resend_api_key}"},
-                json={
-                    "from": f"{from_name} <{settings.smtp_from}>",
-                    "to": [to],
-                    "subject": subject,
-                    "text": body,
-                },
-            )
-        if r.status_code < 300:
-            return {"sent": True, "provider": "resend", "message_id": r.json().get("id"), "to": to}
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(
+                    "https://api.resend.com/emails",
+                    headers={"Authorization": f"Bearer {settings.resend_api_key}"},
+                    json={
+                        "from": f"{from_name} <{settings.smtp_from}>",
+                        "to": [to],
+                        "subject": subject,
+                        "text": body,
+                    },
+                )
+            if r.status_code < 300:
+                return {"sent": True, "provider": "resend", "message_id": r.json().get("id"), "to": to}
+            errors.append(f"resend {r.status_code}: {r.text[:200]}")
+        except Exception as exc:
+            errors.append(f"resend: {exc}")
 
     if settings.sendgrid_api_key:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(
-                "https://api.sendgrid.com/v3/mail/send",
-                headers={"Authorization": f"Bearer {settings.sendgrid_api_key}"},
-                json={
-                    "personalizations": [{"to": [{"email": to}]}],
-                    "from": {"email": settings.smtp_from, "name": from_name},
-                    "subject": subject,
-                    "content": [{"type": "text/plain", "value": body}],
-                },
-            )
-        if r.status_code < 300:
-            return {"sent": True, "provider": "sendgrid", "to": to}
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(
+                    "https://api.sendgrid.com/v3/mail/send",
+                    headers={"Authorization": f"Bearer {settings.sendgrid_api_key}"},
+                    json={
+                        "personalizations": [{"to": [{"email": to}]}],
+                        "from": {"email": settings.smtp_from, "name": from_name},
+                        "subject": subject,
+                        "content": [{"type": "text/plain", "value": body}],
+                    },
+                )
+            if r.status_code < 300:
+                return {"sent": True, "provider": "sendgrid", "to": to}
+            errors.append(f"sendgrid {r.status_code}: {r.text[:200]}")
+        except Exception as exc:
+            errors.append(f"sendgrid: {exc}")
 
     if settings.smtp_username and settings.smtp_password:
         try:
             await asyncio.to_thread(_smtp_send, to, subject, body, from_name)
             return {"sent": True, "provider": "smtp", "to": to}
         except Exception as exc:  # fall through to mock so the pipeline never stalls
-            return {"sent": False, "provider": "smtp", "error": str(exc), "to": to}
+            errors.append(f"smtp: {exc}")
+            return {"sent": False, "provider": "smtp", "error": "; ".join(errors), "to": to}
 
     msg_id = "mock-" + hashlib.md5(f"{to}{subject}".encode()).hexdigest()[:12]
-    return {"sent": True, "provider": "mock", "message_id": msg_id, "to": to}
+    return {"sent": True, "provider": "mock", "message_id": msg_id, "to": to, "errors": errors}
