@@ -1,8 +1,6 @@
-import smtplib
 import random
 import string
 import secrets
-from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy import select
@@ -13,6 +11,7 @@ import asyncio
 from ..database import get_session
 from ..models import User, Session
 from ..config import settings
+from ..services.comms.email import send_email
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -23,21 +22,15 @@ class VerifyRequest(BaseModel):
     email: str
     otp: str
 
-def send_otp_email(to_email: str, otp: str):
-    msg = EmailMessage()
-    msg.set_content(f"Your login OTP for Rael is: {otp}")
-    msg["Subject"] = "Login to Rael"
-    msg["From"] = settings.smtp_from
-    msg["To"] = to_email
-
+async def send_otp_email(to_email: str, otp: str):
     try:
-        server = smtplib.SMTP(settings.smtp_host, settings.smtp_port)
-        server.starttls()
-        server.login(settings.smtp_username, settings.smtp_password)
-        server.send_message(msg)
-        server.quit()
+        result = await send_email(to_email, "Login to Rael", f"Your login OTP for Rael is: {otp}")
     except Exception as e:
-        print(f"Failed to send email: {e}")
+        result = {"sent": False, "error": str(e)}
+    if not result.get("sent") or result.get("provider") == "mock":
+        # No provider could deliver it — surface the OTP in the server logs
+        # so the operator can still log in.
+        print(f"OTP email not delivered ({result.get('error') or result.get('provider')}). OTP for {to_email} is {otp}")
 
 @router.post("/login")
 async def login(req: LoginRequest, db: AsyncSession = Depends(get_session)):
@@ -53,11 +46,9 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_session)):
     user.otp_expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
     await db.commit()
 
-    if settings.smtp_username:
-        asyncio.create_task(asyncio.to_thread(send_otp_email, email, otp))
-    else:
-        print(f"SMTP not configured. OTP for {email} is {otp}")
-        
+    asyncio.create_task(send_otp_email(email, otp))
+
+
     return {"ok": True, "message": "OTP sent"}
 
 @router.post("/verify")
