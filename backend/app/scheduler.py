@@ -9,11 +9,15 @@ from __future__ import annotations
 import logging
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from sqlalchemy import select
 
 from agents.graph import boot, engine
 from agents.orchestrator import orchestrator
 
 from .config import settings
+from .database import SessionLocal
+from .models import User
+from .tenant import current_user_id
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +49,23 @@ def start_scheduler() -> None:
                             return
                     except Exception as e:
                         logger.warning("Could not evaluate enabled_if '%s': %s", cond, e)
-                await orchestrator.dispatch(ev)
+                # Scheduled cycles run once per onboarded account, each inside
+                # that account's tenant context so agents only ever see (and
+                # write) that tenant's Fit Model, Brain, and leads.
+                async with SessionLocal() as s:
+                    user_ids = (
+                        await s.execute(
+                            select(User.id).where(User.onboarding_completed == True)  # noqa: E712
+                        )
+                    ).scalars().all()
+                for uid in user_ids:
+                    token = current_user_id.set(uid)
+                    try:
+                        await orchestrator.dispatch(ev)
+                    except Exception:
+                        logger.exception("Scheduled '%s' failed for user %s", ev, uid)
+                    finally:
+                        current_user_id.reset(token)
 
             return _run
 

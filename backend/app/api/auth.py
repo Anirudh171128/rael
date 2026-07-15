@@ -12,6 +12,7 @@ from ..database import get_session
 from ..models import User, Session
 from ..config import settings
 from ..services.comms.email import send_email
+from ..tenant import current_user_id
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -96,6 +97,9 @@ async def get_current_user(authorization: str = Header(None), db: AsyncSession =
         raise HTTPException(status_code=401, detail="Session expired")
         
     user = (await db.execute(select(User).where(User.id == session.user_id))).scalar()
+    # Everything after this point — the endpoint, agent pipelines it spawns,
+    # background tasks — operates on this user's data only (see models.py hooks).
+    current_user_id.set(user.id)
     return user
 
 @router.post("/logout")

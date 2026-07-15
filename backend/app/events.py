@@ -11,6 +11,7 @@ from typing import Any
 
 from .database import SessionLocal
 from .models import AgentLog
+from .tenant import current_user_id
 from .websocket import manager
 
 
@@ -37,6 +38,7 @@ async def log_event(
         await session.refresh(row)
         created_at = row.created_at or datetime.now(timezone.utc)
 
+    # Only the tenant this event belongs to sees it on their live feed.
     await manager.broadcast(
         {
             "channel": "feed",
@@ -48,5 +50,6 @@ async def log_event(
             "level": level,
             "metadata": extra,
             "created_at": created_at.isoformat(),
-        }
+        },
+        user_id=row.user_id if row.user_id is not None else current_user_id.get(),
     )

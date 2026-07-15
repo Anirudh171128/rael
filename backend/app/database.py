@@ -74,3 +74,23 @@ async def init_db() -> None:
             # Non-pgvector Postgres or insufficient privs — vector cols degrade.
             pass
         await conn.run_sync(Base.metadata.create_all)
+
+        # Multi-tenancy retrofit: create_all never adds columns to existing
+        # tables, so bolt user_id onto deployments created before TenantMixin.
+        # Rows from before tenancy belong to the first account ever created.
+        tenant_tables = [
+            "fit_model", "leads", "interactions", "signals", "lead_memory",
+            "outcomes", "agent_logs", "product_brain", "discovered_companies",
+        ]
+        for t in tenant_tables:
+            await conn.execute(text(
+                f"ALTER TABLE {t} ADD COLUMN IF NOT EXISTS user_id "
+                f"INTEGER REFERENCES users(id) ON DELETE CASCADE"
+            ))
+            await conn.execute(text(
+                f"CREATE INDEX IF NOT EXISTS ix_{t}_user_id ON {t} (user_id)"
+            ))
+            await conn.execute(text(
+                f"UPDATE {t} SET user_id = (SELECT MIN(id) FROM users) "
+                f"WHERE user_id IS NULL"
+            ))

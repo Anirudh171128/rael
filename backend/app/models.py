@@ -15,10 +15,25 @@ from sqlalchemy import (
     Text,
     func,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import event
+from sqlalchemy.orm import Mapped, Session as OrmSession, mapped_column, with_loader_criteria
 
 from .config import settings
 from .database import Base
+from .tenant import current_user_id
+
+
+class TenantMixin:
+    """Every table that belongs to one account carries the owning user.
+
+    The ORM hooks at the bottom of this module do the rest: every SELECT /
+    UPDATE / DELETE against a TenantMixin table is filtered to the current
+    tenant, and every INSERT is stamped with it — no per-query .where() needed.
+    """
+
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
 
 
 class User(Base):
@@ -40,7 +55,7 @@ class Session(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
-class FitModel(Base):
+class FitModel(TenantMixin, Base):
     __tablename__ = "fit_model"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     parameter_name: Mapped[str] = mapped_column(String)
@@ -50,7 +65,7 @@ class FitModel(Base):
     updated_from: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
-class Lead(Base):
+class Lead(TenantMixin, Base):
     __tablename__ = "leads"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     company_name: Mapped[str] = mapped_column(String)
@@ -83,7 +98,7 @@ class Lead(Base):
     assigned_to: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
-class Interaction(Base):
+class Interaction(TenantMixin, Base):
     __tablename__ = "interactions"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     lead_id: Mapped[int | None] = mapped_column(ForeignKey("leads.id", ondelete="CASCADE"), nullable=True)
@@ -101,7 +116,7 @@ class Interaction(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class Signal(Base):
+class Signal(TenantMixin, Base):
     __tablename__ = "signals"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     company_name: Mapped[str] = mapped_column(String)
@@ -114,7 +129,7 @@ class Signal(Base):
     lead_id: Mapped[int | None] = mapped_column(ForeignKey("leads.id", ondelete="SET NULL"), nullable=True)
 
 
-class LeadMemory(Base):
+class LeadMemory(TenantMixin, Base):
     __tablename__ = "lead_memory"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     lead_id: Mapped[int | None] = mapped_column(ForeignKey("leads.id", ondelete="CASCADE"), nullable=True)
@@ -123,7 +138,7 @@ class LeadMemory(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class Outcome(Base):
+class Outcome(TenantMixin, Base):
     __tablename__ = "outcomes"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     lead_id: Mapped[int | None] = mapped_column(ForeignKey("leads.id", ondelete="CASCADE"), nullable=True)
@@ -135,7 +150,7 @@ class Outcome(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class AgentLog(Base):
+class AgentLog(TenantMixin, Base):
     __tablename__ = "agent_logs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     agent_name: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -155,7 +170,7 @@ class SuppressionList(Base):
     reason: Mapped[str | None] = mapped_column(String, nullable=True)
     suppressed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-class ProductBrain(Base):
+class ProductBrain(TenantMixin, Base):
     """Rael's distilled understanding of what we sell and who buys it — Gemini
     turns the raw Fit Model answers into a structured brain the discovery engine
     reasons over (buyers, pain signals, negative signals, search themes). Latest
@@ -171,7 +186,7 @@ class ProductBrain(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class DiscoveredCompany(Base):
+class DiscoveredCompany(TenantMixin, Base):
     """A company the discovery engine surfaced, with the evidence that surfaced it
     and the verification we did before trusting it. This is the holding pen BEFORE
     a Lead exists — a row is promoted to a Lead only once it clears qualification,
@@ -203,3 +218,39 @@ class DiscoveredCompany(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+# ── Tenant isolation hooks ──────────────────────────────────────────────
+# Registered on the sync Session class, so they fire for every AsyncSession
+# too. When no tenant is set (startup, provider webhooks before the lead is
+# resolved) queries run unfiltered — every user-facing path sets the tenant.
+
+
+@event.listens_for(OrmSession, "do_orm_execute")
+def _scope_to_tenant(execute_state) -> None:
+    if execute_state.is_column_load or execute_state.is_relationship_load:
+        return
+    if not (execute_state.is_select or execute_state.is_update or execute_state.is_delete):
+        return
+    uid = current_user_id.get()
+    if uid is None:
+        return
+    # uid must be a closure variable, not a call inside the lambda — the lambda
+    # SQL system extracts it as a bound parameter on every execution.
+    execute_state.statement = execute_state.statement.options(
+        with_loader_criteria(
+            TenantMixin,
+            lambda cls: cls.user_id == uid,
+            include_aliases=True,
+        )
+    )
+
+
+@event.listens_for(OrmSession, "before_flush")
+def _stamp_tenant(session, flush_context, instances) -> None:
+    uid = current_user_id.get()
+    if uid is None:
+        return
+    for obj in session.new:
+        if isinstance(obj, TenantMixin) and obj.user_id is None:
+            obj.user_id = uid

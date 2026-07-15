@@ -14,7 +14,6 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api import actions, auth, discovery, feed_ws, graph, leads, onboarding, views, webhooks
-from .api.onboarding import ensure_default_fit
 from .config import settings
 from .database import init_db
 from .scheduler import start_scheduler, stop_scheduler
@@ -23,7 +22,6 @@ from .scheduler import start_scheduler, stop_scheduler
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    await ensure_default_fit()  # seed a default Fit Model so the demo works immediately
     start_scheduler()
     yield
     stop_scheduler()

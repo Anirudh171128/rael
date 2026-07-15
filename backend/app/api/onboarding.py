@@ -8,10 +8,11 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..database import SessionLocal, get_session
+from ..database import get_session
 from ..events import log_event
 from ..models import FitModel, User
 from ..schemas import FitParam, OnboardingPayload
+from ..tenant import current_user_id
 from .auth import get_current_user
 
 router = APIRouter(prefix="/api/onboarding", tags=["onboarding"], dependencies=[Depends(get_current_user)])
@@ -21,7 +22,14 @@ DEFAULT_WEIGHTS = ["size", "industry", "title", "geography", "trigger"]
 
 async def _seed(session: AsyncSession, p: OnboardingPayload) -> None:
     # Replace prior onboarding-sourced params; keep outcome-tuned weight rows.
-    await session.execute(delete(FitModel).where(FitModel.updated_from == "onboarding"))
+    # The tenant hook already scopes this delete; the explicit filter is
+    # defense-in-depth — re-onboarding must never wipe another account.
+    await session.execute(
+        delete(FitModel).where(
+            FitModel.updated_from == "onboarding",
+            FitModel.user_id == current_user_id.get(),
+        )
+    )
     rows = {
         "product_description": p.product_description,
         "targets": p.targets,
@@ -86,26 +94,3 @@ async def _post_training() -> None:
 async def get_fit(session: AsyncSession = Depends(get_session)):
     rows = (await session.execute(select(FitModel).order_by(FitModel.parameter_name))).scalars().all()
     return rows
-
-
-async def ensure_default_fit() -> None:
-    """Seed a sensible default Fit Model on first boot so the demo loop works
-    before the user has filled the onboarding form (mirrors the user story's ICP)."""
-    async with SessionLocal() as s:
-        count = len((await s.execute(select(FitModel))).scalars().all())
-        if count:
-            return
-        await _seed(
-            s,
-            OnboardingPayload(
-                product_description="We help B2B sales teams enrich leads and automate outreach",
-                targets="Series A–B SaaS, fintech and B2B services companies in India scaling their sales teams",
-                icp_company_size_min=50,
-                icp_company_size_max=500,
-                icp_industries=["SaaS", "Fintech", "B2B Services"],
-                icp_geographies=["India"],
-                icp_titles=["VP Sales", "Head of Growth", "Founder", "Revenue Lead"],
-                pain_solved="reps waste 3 hours/day on manual research and list building",
-            ),
-        )
-        await s.commit()

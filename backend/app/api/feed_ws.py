@@ -17,22 +17,26 @@ from ..websocket import manager
 router = APIRouter()
 
 
-async def _valid_token(token: str | None) -> bool:
+async def _user_for_token(token: str | None) -> int | None:
+    """Resolve the session token to its owning user id (None = invalid/expired)."""
     if not token:
-        return False
+        return None
     async with SessionLocal() as s:
         row = (await s.execute(select(UserSession).where(UserSession.token == token))).scalar()
     if not row:
-        return False
-    return row.expires_at.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc)
+        return None
+    if row.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+        return None
+    return row.user_id
 
 
 @router.websocket("/ws/feed")
 async def feed(ws: WebSocket):
-    if not await _valid_token(ws.query_params.get("token")):
+    user_id = await _user_for_token(ws.query_params.get("token"))
+    if user_id is None:
         await ws.close(code=4401)
         return
-    await manager.connect(ws)
+    await manager.connect(ws, user_id)
     try:
         await ws.send_json({"channel": "system", "description": "connected to Rael's live feed"})
         while True:
